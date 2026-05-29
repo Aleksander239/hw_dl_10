@@ -28,7 +28,18 @@ def parse_mc_answer(text: str, choices: tuple[str, ...] = CHOICES) -> str | None
             "Answer: C"
             "The correct answer is D."
     """
-    raise NotImplementedError("Implement parse_mc_answer")
+    text = text.strip()
+
+    pattern = rf"(?:[Aa]nswer|option|is|\(|^|\s)([{''.join(choices)}])(?:\)|\.|\s|$)"
+    matches = re.findall(pattern, text)
+    
+    if matches:
+        return matches[-1].upper()
+    
+    for char in reversed(text.split()):
+        clean_char = re.sub(r'[^a-zA-Z]', '', char).upper()
+        if clean_char in choices:
+            return clean_char
 
 
 def build_benchmark_prompt(question: str, options: list[str]) -> str:
@@ -71,7 +82,70 @@ def run_benchmark(config: dict[str, Any], toy: bool = False) -> dict[str, float]
         - write predictions if output_path is provided;
         - return metrics.
     """
-    raise NotImplementedError("Implement benchmark loop")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    tokenizer = AutoTokenizer.from_pretrained(config["model"]["text_model_id"])
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+    processor = MathVLMProcessor(tokenizer, config=ProcessorConfig(
+        image_size=config["model"]["image_size"],
+        num_image_tokens=config["model"]["num_image_tokens"],
+    ))
+
+    eval_dataset = MathVQADataset(
+        manifest_path=config["data"]["eval_manifest"],
+        split="test" if not toy else "train",
+        max_samples=10 if toy else config["data"].get("max_eval_samples"),
+    )
+
+    vision_encoder = AutoModel.from_pretrained(config["model"]["vision_model_id"])
+    language_model = AutoModelForCausalLM.from_pretrained(config["model"]["text_model_id"])
+    
+    model_config = ModelConfig(
+        vision_hidden_size=config["model"]["vision_hidden_size"],
+        text_hidden_size=config["model"]["text_hidden_size"],
+        num_image_tokens=config["model"]["num_image_tokens"],
+        image_token_id=tokenizer.convert_tokens_to_ids(IMAGE_TOKEN),
+    )
+    
+    model = MathVLM(vision_encoder, language_model, model_config)
+    
+    adapter_path = Path(config["train"]["output_dir"]) / "adapter.bin"
+    if adapter_path.exists():
+        model.adapter.load_state_dict(torch.load(adapter_path, map_location="cpu"))
+    
+    model.to(device)
+    model.eval()
+
+    results = []
+
+    for i in range(len(eval_dataset)):
+        sample = eval_dataset[i]
+        batch = processor.collate([processor(sample)])
+        
+        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+
+        with torch.no_grad():
+            generated_ids = model.generate(batch, max_new_tokens=20, do_sample=False)
+ 
+            input_len = batch["input_ids"].shape[1]
+            output_text = tokenizer.decode(generated_ids[0][input_len:], skip_special_tokens=True)
+        
+        prediction = parse_mc_answer(output_text)
+        
+        results.append({
+            "id": sample.id,
+            "subject": sample.subject,
+            "answer": sample.answer,
+            "prediction": prediction,
+            "output": output_text
+        })
+
+
+    metrics = compute_accuracy(results)
+
+    return metrics
 
 
 def main() -> None:
